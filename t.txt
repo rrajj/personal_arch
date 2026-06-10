@@ -1,0 +1,223 @@
+def agent_describe(img: Image.Image, context: str = "") -> dict:
+    """First pass — describe the diagram as-is."""
+    
+    image_b64 = image_to_base64(img)
+    
+    prompt = f"""You are a senior software architect analyzing an approved architecture diagram.
+
+{f'Context about this project: {context}' if context else ''}
+
+Carefully extract:
+1. Every component/service — exact label as shown
+2. Every connection — source, target, direction, and type (solid=sync, dashed=async)
+3. Every data store — type and label (cylinder=DB, rectangle=cache, etc.)
+4. Architecture pattern (microservices, event-driven, layered, monolith, etc.)
+5. Any groupings or boundaries visible
+6. Anything you are UNCERTAIN about — flag it explicitly
+
+Respond in JSON:
+{{
+  "components": [{{"id": "c1", "label": "...", "type": "service|db|queue|gateway|external"}}],
+  "connections": [{{"from": "c1", "to": "c2", "direction": "->", "type": "sync|async|unknown", "label": ""}}],
+  "pattern": "...",
+  "groupings": [...],
+  "uncertain": ["list anything unclear or possibly missed"]
+}}"""
+
+    response = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=2000,
+        messages=[{
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": image_b64
+                    }
+                },
+                {"type": "text", "text": prompt}
+            ]
+        }]
+    )
+    
+    raw = response.content[0].text
+    try:
+        clean = raw.replace("```json", "").replace("```", "").strip()
+        return json.loads(clean)
+    except:
+        return {"raw_text": raw, "parse_error": True}
+
+###################################################################################
+
+def preprocess_targeted(img: Image.Image, uncertain_areas: list[str]) -> Image.Image:
+    """Preprocess with awareness of what Agent 1 was uncertain about."""
+    
+    arr = np.array(img)
+    
+    # Always apply: scale, contrast, sharpness
+    if img.width < 1500:
+        scale = 1500 / img.width
+        img = img.resize((1500, int(img.height * scale)), Image.LANCZOS)
+    
+    img = ImageEnhance.Contrast(img).enhance(2.0)
+    img = ImageEnhance.Sharpness(img).enhance(2.5)
+    
+    # If Agent 1 was uncertain about connections/arrows — enhance lines aggressively
+    uncertain_text = " ".join(uncertain_areas).lower()
+    if any(word in uncertain_text for word in ["arrow", "connection", "line", "flow", "link"]):
+        img = img.filter(ImageFilter.UnsharpMask(radius=2, percent=200, threshold=2))
+        edges = img.filter(ImageFilter.FIND_EDGES)
+        img = ImageChops.subtract(img, edges)
+        
+        arr_cv = np.array(img.convert("L"))
+        inverted = 255 - arr_cv
+        kernel = np.ones((2, 2), np.uint8)
+        dilated = cv2.dilate(inverted, kernel, iterations=2)
+        line_layer = Image.fromarray(255 - dilated).convert("RGB")
+        img = ImageChops.multiply(img, line_layer)
+    
+    # If Agent 1 was uncertain about text/labels — boost contrast more
+    if any(word in uncertain_text for word in ["label", "text", "name", "unclear", "unreadable"]):
+        arr = np.array(img.convert("L"))
+        thresholded = cv2.adaptiveThreshold(
+            arr, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            blockSize=11, C=2
+        )
+        img = Image.fromarray(thresholded).convert("RGB")
+    
+    # If Agent 1 was uncertain about boundaries/groupings — boost color saturation
+    if any(word in uncertain_text for word in ["boundary", "group", "region", "zone", "cluster"]):
+        img = ImageEnhance.Color(img).enhance(2.0)
+    
+    return img
+
+
+def agent_reanalyze(img: Image.Image, first_description: dict) -> dict:
+    """Second pass — preprocess based on uncertainties, describe again."""
+    
+    uncertain = first_description.get("uncertain", [])
+    enhanced_img = preprocess_targeted(img, uncertain)
+    image_b64 = image_to_base64(enhanced_img)
+    
+    # Tell Agent 2 exactly what Agent 1 was unsure about
+    uncertain_str = "\n".join(f"- {u}" for u in uncertain) if uncertain else "None flagged"
+    
+    prompt = f"""You are a senior software architect doing a SECOND careful analysis of this architecture diagram.
+
+A previous analysis found these uncertainties:
+{uncertain_str}
+
+This image has been preprocessed to make lines, arrows, and labels more visible.
+Focus especially on resolving the uncertainties listed above.
+
+Extract the same structured information:
+1. Every component/service — exact label
+2. Every connection — source, target, direction, type
+3. Every data store
+4. Architecture pattern
+5. Any groupings or boundaries
+6. What you can now see that was previously uncertain
+
+Respond in JSON:
+{{
+  "components": [{{"id": "c1", "label": "...", "type": "..."}}],
+  "connections": [{{"from": "c1", "to": "c2", "direction": "->", "type": "sync|async|unknown", "label": ""}}],
+  "pattern": "...",
+  "groupings": [...],
+  "newly_found": ["things found in this pass not in first pass"],
+  "still_uncertain": ["things still unclear even after enhancement"]
+}}"""
+
+    response = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=2000,
+        messages=[{
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": image_b64
+                    }
+                },
+                {"type": "text", "text": prompt}
+            ]
+        }]
+    )
+    
+    raw = response.content[0].text
+    try:
+        clean = raw.replace("```json", "").replace("```", "").strip()
+        return json.loads(clean)
+    except:
+        return {"raw_text": raw, "parse_error": True}
+
+#############################################################################
+
+def agent_reconcile(
+    first: dict,
+    second: dict,
+    image_path: str
+) -> dict:
+    """Merge both descriptions into one high-confidence final output."""
+    
+    prompt = f"""You are a senior software architect reconciling two analyses of the same architecture diagram.
+
+FIRST ANALYSIS:
+{json.dumps(first, indent=2)}
+
+SECOND ANALYSIS (from enhanced image):
+{json.dumps(second, indent=2)}
+
+Your job:
+1. MERGE components — union of both lists, resolve duplicates by label similarity
+2. MERGE connections — keep connections found in EITHER analysis; flag ones only found in one
+3. RESOLVE conflicts — if analyses disagree, note the conflict and pick the more likely answer
+4. CONFIDENCE scoring — rate each component and connection: high/medium/low
+5. Produce the final clean description
+
+Respond in JSON:
+{{
+  "components": [{{
+    "id": "c1",
+    "label": "...",
+    "type": "...",
+    "confidence": "high|medium|low",
+    "found_in": "both|first_only|second_only"
+  }}],
+  "connections": [{{
+    "from": "c1",
+    "to": "c2",
+    "direction": "->",
+    "type": "sync|async|unknown",
+    "label": "",
+    "confidence": "high|medium|low",
+    "found_in": "both|first_only|second_only"
+  }}],
+  "pattern": "...",
+  "pattern_confidence": "high|medium|low",
+  "groupings": [...],
+  "conflicts": ["describe any disagreements between the two analyses"],
+  "low_confidence_items": ["list anything still uncertain after both passes"],
+  "final_summary": "2-3 sentence plain English summary of this architecture"
+}}"""
+
+    response = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=2500,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    
+    raw = response.content[0].text
+    try:
+        clean = raw.replace("```json", "").replace("```", "").strip()
+        return json.loads(clean)
+    except:
+        return {"raw_text": raw, "parse_error": True}
