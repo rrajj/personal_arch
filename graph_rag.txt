@@ -1,0 +1,142 @@
+from google.adk.agents import Agent
+from google.adk.tools import FunctionTool
+import psycopg2
+from psycopg2.extras import RealDictCursor
+
+# Tool: execute any dynamic SQL query
+def execute_query(sql: str, params: list = []):
+    """
+    Executes a dynamic SQL query against the permit graph database.
+    Returns results as a list of dictionaries.
+    """
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute(sql, params)
+        results = cur.fetchall()
+        conn.close()
+        return {"success": True, "data": results, "row_count": len(results)}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+# Tool: get schema context so agent knows what tables/columns exist
+def get_schema_context():
+    """Returns the database schema for the agent to understand available tables."""
+    return """
+    TABLE: arb_graph_nodes
+    - id          UUID        → unique node identifier
+    - type        TEXT        → 'permit' or 'pts'
+    - timestamp   TIMESTAMPTZ → when node was created
+    - is_deleted  BOOLEAN     → soft delete flag
+    - properties  JSONB       → flexible data storage:
+                                 For permits: { permit_number, permit_type, 
+                                               status, approved_at, 
+                                               submitted_at, expires_at }
+                                 For pts:     { pts_id, name }
+    - embedding_text TEXT     → raw text used to generate embedding
+    - embedding   VECTOR      → semantic vector
+    - tsv         TSVECTOR    → for full text search
+
+    TABLE: arb_graph_edges
+    - id          UUID  → unique edge identifier
+    - source_id   UUID  → references arb_graph_nodes.id (usually pts node)
+    - target_id   UUID  → references arb_graph_nodes.id (usually permit node)
+    - relation    TEXT  → e.g. 'HAS_PERMIT'
+    - properties  JSONB → extra edge metadata
+    - page_id     UUID  → optional page reference
+
+    TABLE: arb_permit_embeddings
+    - id          UUID        → unique embedding identifier
+    - permit_id   UUID        → references arb_graph_nodes.id (permit node)
+    - pts_id      UUID        → references arb_graph_nodes.id (pts node)
+    - permit_type TEXT        → 'to_design', 'to_build', 'to_deploy'
+    - text        TEXT        → full text description of permit
+    - embedding   VECTOR      → semantic vector for similarity search
+    - timestamp   TIMESTAMPTZ → when embedding was created
+    - is_deleted  BOOLEAN     → soft delete flag
+    - tsv         TSVECTOR    → for full text search
+    """
+
+# SQL Agent
+sql_agent = Agent(
+    name="sql_agent",
+    model="gemini-2.0-flash",
+    description="Writes and executes dynamic SQL queries against the permit graph database.",
+    instruction="""
+        You are a PostgreSQL expert that writes dynamic SQL queries.
+        
+        You have access to these tools:
+        - get_schema_context: call this first to understand the tables
+        - execute_query: runs the SQL you write
+        
+        Rules:
+        1. ALWAYS call get_schema_context first before writing any query
+        2. Write safe, read-only SELECT queries only — never INSERT, UPDATE, DELETE
+        3. Use properties->>'field_name' to access JSONB fields
+        4. For semantic search use: embedding <=> '[vector]'::vector
+        5. For keyword search use: tsv @@ to_tsquery('keyword')
+        6. Always filter is_deleted = false
+        7. Return clear, structured results
+        
+        Example queries you can write:
+        
+        -- Find all permits for a PTS
+        SELECT 
+            source.properties->>'pts_id'        AS pts_id,
+            target.properties->>'permit_number'  AS permit_number,
+            target.properties->>'permit_type'    AS permit_type,
+            target.properties->>'status'         AS status,
+            target.properties->>'approved_at'    AS approved_at
+        FROM arb_graph_edges e
+        JOIN arb_graph_nodes source ON source.id = e.source_id
+        JOIN arb_graph_nodes target ON target.id = e.target_id
+        WHERE source.properties->>'pts_id' = 'PTS-001'
+          AND source.is_deleted = false
+          AND target.is_deleted = false;
+    """,
+    tools=[
+        FunctionTool(get_schema_context),
+        FunctionTool(execute_query)
+    ]
+)
+
+
+
+
+
+from google.adk.agents import Agent
+from google.adk.tools import AgentTool
+
+# Root Agent
+root_agent = Agent(
+    name="root_agent",
+    model="gemini-2.0-flash",
+    description="Root agent that understands user intent and delegates to specialized agents.",
+    instruction="""
+        You are a permit management assistant.
+        
+        Your job is to:
+        1. Understand what the user is asking
+        2. Identify the intent:
+            - LOOKUP    → user wants specific permit or PTS info
+            - SEARCH    → user wants to find permits by criteria
+            - ANALYSIS  → user wants counts, comparisons, trends
+            - AMBIGUOUS → query is unclear, ask for clarification
+        
+        3. If AMBIGUOUS → ask the user to clarify before delegating
+        4. For all other intents → delegate to sql_agent with a clear,
+           structured description of what data to fetch
+        
+        When delegating, always tell sql_agent:
+        - What tables are likely involved
+        - What filters to apply (dates, status, type, PTS id, etc.)
+        - What fields to return
+        
+        Then take the sql_agent results and format a clear,
+        human-readable answer for the user.
+    """,
+    tools=[
+        AgentTool(sql_agent)   # root agent can call sql_agent as a tool
+    ]
+)
