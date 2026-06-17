@@ -140,3 +140,146 @@ root_agent = Agent(
         AgentTool(sql_agent)   # root agent can call sql_agent as a tool
     ]
 )
+
+
+
+
+###########################################################################################
+
+import openai
+
+# Tool: embed the user query
+def embed_query(text: str):
+    """Converts user query text into a vector embedding."""
+    response = openai.embeddings.create(
+        input=text,
+        model="text-embedding-3-small"
+    )
+    return response.data[0].embedding
+
+
+# Tool: vector search on arb_permit_embeddings
+def vector_search(query_embedding: list, permit_type: str = None, limit: int = 5):
+    """
+    Finds most semantically similar permits using embedding similarity.
+    This is the RAG retrieval step.
+    """
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+
+    sql = """
+        SELECT 
+            permit_id,
+            pts_id,
+            permit_type,
+            text,
+            embedding <=> %s::vector AS distance
+        FROM arb_permit_embeddings
+        WHERE is_deleted = false
+        {filter}
+        ORDER BY distance
+        LIMIT %s
+    """.format(filter="AND permit_type = %s" if permit_type else "")
+
+    params = [query_embedding, permit_type, limit] if permit_type else [query_embedding, limit]
+    cur.execute(sql, params)
+    return cur.fetchall()
+
+
+# Tool: graph expansion from retrieved permit ids
+def expand_graph(permit_ids: list):
+    """
+    Given permit node ids found via vector search,
+    expand the graph to get connected PTS nodes and edge metadata.
+    This is the GRAPH part of Graph RAG.
+    """
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+
+    sql = """
+        SELECT 
+            source.properties   AS pts_properties,
+            target.properties   AS permit_properties,
+            e.relation,
+            e.properties        AS edge_properties
+        FROM arb_graph_edges e
+        JOIN arb_graph_nodes source ON source.id = e.source_id
+        JOIN arb_graph_nodes target ON target.id = e.target_id
+        WHERE target.id = ANY(%s::uuid[])
+          AND source.is_deleted = false
+          AND target.is_deleted = false
+    """
+    cur.execute(sql, [permit_ids])
+    return cur.fetchall()
+
+
+# Embedding Agent
+embedding_agent = Agent(
+    name="embedding_agent",
+    model="gemini-2.0-flash",
+    description="Handles semantic retrieval using embeddings then expands via graph.",
+    instruction="""
+        You are a Graph RAG retrieval agent. Follow these steps strictly:
+
+        STEP 1 — Embed the user query
+            Call embed_query(text) with the user's question
+
+        STEP 2 — Vector search (RAG retrieval)
+            Call vector_search(query_embedding) with the embedding from step 1
+            This finds the most semantically relevant permits
+
+        STEP 3 — Graph expansion
+            Take the permit_ids from step 2
+            Call expand_graph(permit_ids) to get connected PTS nodes
+            This enriches the context with graph relationships
+
+        STEP 4 — Return enriched context
+            Combine vector search results + graph expansion results
+            Return as structured context for the root agent to answer from
+
+        This is Graph RAG:
+        - Vector search = RAG (finds relevant nodes semantically)
+        - Graph expansion = Graph (enriches with connected context)
+    """,
+    tools=[
+        FunctionTool(embed_query),
+        FunctionTool(vector_search),
+        FunctionTool(expand_graph)
+    ]
+)
+
+
+
+root_agent = Agent(
+    name="root_agent",
+    model="gemini-2.0-flash",
+    description="Root agent that routes to the right agent based on user intent.",
+    instruction="""
+        You are a permit management assistant.
+
+        Identify the user intent:
+
+        SEMANTIC / VAGUE queries → delegate to embedding_agent
+            Examples:
+            - "Find permits related to infrastructure deployment"
+            - "What permissions exist for cloud apps?"
+            - "Show me anything related to design approvals"
+
+        SPECIFIC / STRUCTURED queries → delegate to sql_agent
+            Examples:
+            - "What permits were approved for PTS-001 last year?"
+            - "Show all expired permits"
+            - "How many build permits exist?"
+
+        COMPLEX queries → call BOTH agents and combine results
+            Examples:
+            - "Find deployment permits for PTS-001 related to cloud infrastructure"
+              (specific PTS + semantic meaning)
+
+        Always format the final answer clearly for the user.
+    """,
+    tools=[
+        AgentTool(embedding_agent),  # Graph RAG — semantic + graph expansion
+        AgentTool(sql_agent)         # Dynamic SQL — structured queries
+    ]
+)
