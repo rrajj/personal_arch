@@ -1,8 +1,8 @@
-from fastapi import FastAPI
+from fastapi import APIRouter
 from pydantic import BaseModel
 from typing import List, Literal
 
-app = FastAPI()
+router = APIRouter()
 
 
 class Person(BaseModel):
@@ -17,12 +17,11 @@ class PbqAnswer(BaseModel):
 
 class CreatePptRequest(BaseModel):
     pts_id: str
-    permit_type: Literal["Build", "Deploy"]
     architecture: List[Person]
     presenter: List[Person]
     pbq_answers: List[PbqAnswer]
 
 
-@app.post("/create_ppt_template")
-def create_ppt_template(request: CreatePptRequest):
+@router.post("/generate_pb_ppt")
+def generate_pb_ppt(request: CreatePptRequest):
     return request
