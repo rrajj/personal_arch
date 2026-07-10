@@ -33,3 +33,36 @@ def build_slide(prs, source_index, keep_shape_names):
         if shape.name not in keep_shape_names:
             shape._element.getparent().remove(shape._element)
     return new_slide
+
+
+from pptx.util import Inches, Pt
+
+def add_review_scope(prs):
+    slide = basic_slide(prs, 1, keep_shapes=[_BLANK_SLIDE_SHAPES])
+    set_text_by_shape_id(slide, 2, "REVIEW SCOPE")
+
+    rows, cols = 4, 3
+    left = Inches(0.5)
+    top = Inches(1.5)
+    width = Inches(9)
+    height = Inches(4)
+
+    graphic_frame = slide.shapes.add_table(rows, cols, left, top, width, height)
+    table = graphic_frame.table
+
+    # header row
+    table.cell(0, 0).text = "Item"
+    table.cell(0, 1).text = "Owner"
+    table.cell(0, 2).text = "Status"
+
+    # data rows
+    data = [
+        ("Design review", "Alice", "In progress"),
+        ("Code review", "Bob", "Done"),
+        ("Security review", "Carol", "Pending"),
+    ]
+    for r, row_data in enumerate(data, start=1):
+        for c, value in enumerate(row_data):
+            table.cell(r, c).text = value
+
+    return slide
