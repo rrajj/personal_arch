@@ -87,3 +87,13 @@ def style_table(table, header_size=14, body_size=11):
 
 style_table(table, header_size=14, body_size=11)
 
+
+def set_cell_text(cell, text, size=12, bold=False):
+    tf = cell.text_frame
+    tf.clear()  # removes existing paragraphs/runs, leaves one empty paragraph
+    run = tf.paragraphs[0].add_run()
+    run.text = text
+    run.font.size = Pt(size)
+    run.font.bold = bold
+
+
