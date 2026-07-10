@@ -66,3 +66,24 @@ def add_review_scope(prs):
             table.cell(r, c).text = value
 
     return slide
+
+
+from pptx.util import Pt
+
+def style_table(table, header_size=14, body_size=11):
+    # header row (row 0) — larger, bold
+    for cell in table.rows[0].cells:
+        for para in cell.text_frame.paragraphs:
+            for run in para.runs:
+                run.font.size = Pt(header_size)
+                run.font.bold = True
+
+    # body rows — normal size
+    for row in table.rows[1:]:
+        for cell in row.cells:
+            for para in cell.text_frame.paragraphs:
+                for run in para.runs:
+                    run.font.size = Pt(body_size)
+
+style_table(table, header_size=14, body_size=11)
+
